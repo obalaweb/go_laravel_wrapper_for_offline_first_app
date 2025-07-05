@@ -24,13 +24,13 @@ import (
 )
 
 type Config struct {
-	LaravelPath    string `json:"laravel_path"`
-	LocalPort      int    `json:"local_port"`
-	PHPPort        int    `json:"php_port"`
+	LaravelPath    string   `json:"laravel_path"`
+	LocalPort      int      `json:"local_port"`
+	PHPPort        int      `json:"php_port"`
 	LocalDB        DBConfig `json:"local_db"`
 	RemoteDB       DBConfig `json:"remote_db"`
-	SyncInterval   int    `json:"sync_interval_seconds"`
-	CheckInterval  int    `json:"connectivity_check_interval_seconds"`
+	SyncInterval   int      `json:"sync_interval_seconds"`
+	CheckInterval  int      `json:"connectivity_check_interval_seconds"`
 }
 
 type DBConfig struct {
@@ -48,6 +48,20 @@ type SyncRecord struct {
 	Data      string    `json:"data"`      // JSON data
 	CreatedAt time.Time `json:"created_at"`
 	Synced    bool      `json:"synced"`
+}
+
+// Laravel sync request structure
+type LaravelSyncRequest struct {
+	TableName string                 `json:"table_name"`
+	Operation string                 `json:"operation"`
+	Data      map[string]interface{} `json:"data"`
+}
+
+// Response structure for Laravel sync requests
+type SyncResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message,omitempty"`
+	Error   string `json:"error,omitempty"`
 }
 
 type LaravelWrapper struct {
@@ -164,6 +178,11 @@ func (w *LaravelWrapper) setupDatabases() error {
 		return fmt.Errorf("failed to connect to local database: %v", err)
 	}
 
+	// Test local database connection
+	if err := w.localDB.Ping(); err != nil {
+		return fmt.Errorf("failed to ping local database: %v", err)
+	}
+
 	// Create sync table if not exists
 	if err := w.createSyncTable(); err != nil {
 		return fmt.Errorf("failed to create sync table: %v", err)
@@ -195,8 +214,11 @@ func (w *LaravelWrapper) createSyncTable() error {
 		data TEXT NOT NULL,
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 		synced BOOLEAN DEFAULT FALSE,
+		retry_count INT DEFAULT 0,
+		last_error TEXT,
 		INDEX idx_synced (synced),
-		INDEX idx_created_at (created_at)
+		INDEX idx_created_at (created_at),
+		INDEX idx_table_operation (table_name, operation)
 	)`
 
 	_, err := w.localDB.Exec(query)
@@ -275,15 +297,32 @@ func (w *LaravelWrapper) startHTTPServer() {
 	// Status endpoint
 	r.HandleFunc("/status", w.handleStatus).Methods("GET")
 
-	// Sync endpoint
-	r.HandleFunc("/sync", w.handleSync).Methods("POST")
+	// Laravel sync endpoint - this is where Laravel sends sync requests
+	r.HandleFunc("/sync-record", w.handleLaravelSync).Methods("POST")
+
+	// Manual sync endpoint
+	r.HandleFunc("/sync", w.handleManualSync).Methods("POST")
+
+	// Health check endpoint
+	r.HandleFunc("/health", w.handleHealth).Methods("GET")
+
+	// Sync queue status endpoint
+	r.HandleFunc("/queue/status", w.handleQueueStatus).Methods("GET")
+
+	// Clear sync queue endpoint
+	r.HandleFunc("/queue/clear", w.handleClearQueue).Methods("POST")
+
+	// Retry failed sync records
+	r.HandleFunc("/queue/retry", w.handleRetryFailed).Methods("POST")
 
 	// Proxy all other requests to Laravel
 	r.PathPrefix("/").HandlerFunc(w.proxyToLaravel)
 
 	server := &http.Server{
-		Addr:    fmt.Sprintf(":%d", w.config.LocalPort),
-		Handler: r,
+		Addr:         fmt.Sprintf(":%d", w.config.LocalPort),
+		Handler:      r,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 30 * time.Second,
 	}
 
 	// Handle graceful shutdown
@@ -299,7 +338,120 @@ func (w *LaravelWrapper) startHTTPServer() {
 	}()
 
 	log.Printf("Server started on port %d", w.config.LocalPort)
+	log.Printf("Laravel sync endpoint: http://localhost:%d/sync-record", w.config.LocalPort)
 	log.Fatal(server.ListenAndServe())
+}
+
+// Handle Laravel sync requests
+func (w *LaravelWrapper) handleLaravelSync(wr http.ResponseWriter, r *http.Request) {
+	var syncReq LaravelSyncRequest
+	
+	// Parse JSON body
+	if err := json.NewDecoder(r.Body).Decode(&syncReq); err != nil {
+		log.Printf("Failed to parse Laravel sync request: %v", err)
+		w.sendSyncResponse(wr, http.StatusBadRequest, false, "", "Invalid JSON format")
+		return
+	}
+
+	// Validate request
+	if syncReq.TableName == "" || syncReq.Operation == "" {
+		log.Printf("Invalid sync request: missing table_name or operation")
+		w.sendSyncResponse(wr, http.StatusBadRequest, false, "", "Missing table_name or operation")
+		return
+	}
+
+	// Validate operation
+	validOps := map[string]bool{"INSERT": true, "UPDATE": true, "DELETE": true}
+	if !validOps[syncReq.Operation] {
+		log.Printf("Invalid operation: %s", syncReq.Operation)
+		w.sendSyncResponse(wr, http.StatusBadRequest, false, "", "Invalid operation")
+		return
+	}
+
+	log.Printf("Received Laravel sync request: %s %s", syncReq.Operation, syncReq.TableName)
+
+	// Convert data to JSON string
+	dataJSON, err := json.Marshal(syncReq.Data)
+	if err != nil {
+		log.Printf("Failed to marshal sync data: %v", err)
+		w.sendSyncResponse(wr, http.StatusInternalServerError, false, "", "Failed to process data")
+		return
+	}
+
+	// Check if we're online and can sync immediately
+	w.onlineMutex.RLock()
+	online := w.isOnline
+	w.onlineMutex.RUnlock()
+
+	if online {
+		// Try to sync immediately
+		if w.syncRecordToRemote(syncReq.TableName, syncReq.Operation, syncReq.Data) {
+			log.Printf("Successfully synced %s %s immediately", syncReq.Operation, syncReq.TableName)
+			w.sendSyncResponse(wr, http.StatusOK, true, "Synced immediately", "")
+			
+			// Broadcast to WebSocket clients
+			w.broadcast(map[string]interface{}{
+				"type":      "sync_immediate",
+				"table":     syncReq.TableName,
+				"operation": syncReq.Operation,
+			})
+			return
+		}
+	}
+
+	// Add to sync queue if immediate sync failed or we're offline
+	if err := w.addToSyncQueue(syncReq.TableName, syncReq.Operation, string(dataJSON)); err != nil {
+		log.Printf("Failed to add to sync queue: %v", err)
+		w.sendSyncResponse(wr, http.StatusInternalServerError, false, "", "Failed to queue sync")
+		return
+	}
+
+	log.Printf("Added to sync queue: %s %s", syncReq.Operation, syncReq.TableName)
+	w.sendSyncResponse(wr, http.StatusOK, true, "Queued for sync", "")
+
+	// Broadcast to WebSocket clients
+	w.broadcast(map[string]interface{}{
+		"type":      "sync_queued",
+		"table":     syncReq.TableName,
+		"operation": syncReq.Operation,
+	})
+}
+
+func (w *LaravelWrapper) sendSyncResponse(wr http.ResponseWriter, statusCode int, success bool, message, error string) {
+	wr.Header().Set("Content-Type", "application/json")
+	wr.WriteHeader(statusCode)
+	
+	resp := SyncResponse{
+		Success: success,
+		Message: message,
+		Error:   error,
+	}
+	
+	json.NewEncoder(wr).Encode(resp)
+}
+
+func (w *LaravelWrapper) addToSyncQueue(tableName, operation, data string) error {
+	query := "INSERT INTO sync_queue (table_name, operation, data) VALUES (?, ?, ?)"
+	_, err := w.localDB.Exec(query, tableName, operation, data)
+	return err
+}
+
+func (w *LaravelWrapper) syncRecordToRemote(tableName, operation string, data map[string]interface{}) bool {
+	if w.remoteDB == nil {
+		return false
+	}
+
+	switch operation {
+	case "INSERT":
+		return w.performInsert(tableName, data)
+	case "UPDATE":
+		return w.performUpdate(tableName, data)
+	case "DELETE":
+		return w.performDelete(tableName, data)
+	default:
+		log.Printf("Unknown operation: %s", operation)
+		return false
+	}
 }
 
 func (w *LaravelWrapper) handleWebSocket(wr http.ResponseWriter, r *http.Request) {
@@ -318,6 +470,13 @@ func (w *LaravelWrapper) handleWebSocket(wr http.ResponseWriter, r *http.Request
 	w.sendToClient(conn, map[string]interface{}{
 		"type":   "status",
 		"online": w.isOnline,
+	})
+
+	// Send queue status
+	pendingCount := w.getPendingSyncCount()
+	w.sendToClient(conn, map[string]interface{}{
+		"type":    "queue_status",
+		"pending": pendingCount,
 	})
 
 	// Handle client messages
@@ -354,24 +513,128 @@ func (w *LaravelWrapper) handleStatus(wr http.ResponseWriter, r *http.Request) {
 	w.onlineMutex.RUnlock()
 
 	// Get pending sync count
-	var pendingCount int
-	w.localDB.QueryRow("SELECT COUNT(*) FROM sync_queue WHERE synced = FALSE").Scan(&pendingCount)
+	pendingCount := w.getPendingSyncCount()
+
+	// Get failed sync count
+	failedCount := w.getFailedSyncCount()
 
 	status := map[string]interface{}{
 		"online":       online,
 		"pending_sync": pendingCount,
+		"failed_sync":  failedCount,
 		"local_port":   w.config.LocalPort,
 		"php_port":     w.config.PHPPort,
+		"timestamp":    time.Now().Format(time.RFC3339),
 	}
 
 	wr.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(wr).Encode(status)
 }
 
-func (w *LaravelWrapper) handleSync(wr http.ResponseWriter, r *http.Request) {
+func (w *LaravelWrapper) handleManualSync(wr http.ResponseWriter, r *http.Request) {
 	go w.performSync()
 	wr.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(wr).Encode(map[string]string{"status": "sync_started"})
+}
+
+func (w *LaravelWrapper) handleHealth(wr http.ResponseWriter, r *http.Request) {
+	health := map[string]interface{}{
+		"status":    "healthy",
+		"timestamp": time.Now().Format(time.RFC3339),
+		"services": map[string]bool{
+			"local_db":   w.isDBHealthy(w.localDB),
+			"remote_db":  w.isDBHealthy(w.remoteDB),
+			"php_server": w.isPortOpen("127.0.0.1", w.config.PHPPort),
+		},
+	}
+
+	wr.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(wr).Encode(health)
+}
+
+func (w *LaravelWrapper) handleQueueStatus(wr http.ResponseWriter, r *http.Request) {
+	pendingCount := w.getPendingSyncCount()
+	failedCount := w.getFailedSyncCount()
+	
+	// Get oldest pending record
+	var oldestPending *time.Time
+	row := w.localDB.QueryRow("SELECT created_at FROM sync_queue WHERE synced = FALSE ORDER BY created_at ASC LIMIT 1")
+	var timestamp time.Time
+	if err := row.Scan(&timestamp); err == nil {
+		oldestPending = &timestamp
+	}
+
+	status := map[string]interface{}{
+		"pending_count": pendingCount,
+		"failed_count":  failedCount,
+		"oldest_pending": oldestPending,
+		"timestamp":     time.Now().Format(time.RFC3339),
+	}
+
+	wr.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(wr).Encode(status)
+}
+
+func (w *LaravelWrapper) handleClearQueue(wr http.ResponseWriter, r *http.Request) {
+	result, err := w.localDB.Exec("DELETE FROM sync_queue WHERE synced = TRUE")
+	if err != nil {
+		log.Printf("Failed to clear sync queue: %v", err)
+		http.Error(wr, "Failed to clear queue", http.StatusInternalServerError)
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	response := map[string]interface{}{
+		"status":        "cleared",
+		"rows_affected": rowsAffected,
+	}
+
+	wr.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(wr).Encode(response)
+}
+
+func (w *LaravelWrapper) handleRetryFailed(wr http.ResponseWriter, r *http.Request) {
+	// Reset failed records for retry
+	result, err := w.localDB.Exec("UPDATE sync_queue SET retry_count = 0, last_error = NULL WHERE retry_count > 0")
+	if err != nil {
+		log.Printf("Failed to reset failed records: %v", err)
+		http.Error(wr, "Failed to reset failed records", http.StatusInternalServerError)
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	
+	// Trigger sync
+	go w.performSync()
+
+	response := map[string]interface{}{
+		"status":        "retry_started",
+		"rows_affected": rowsAffected,
+	}
+
+	wr.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(wr).Encode(response)
+}
+
+func (w *LaravelWrapper) getPendingSyncCount() int {
+	var count int
+	w.localDB.QueryRow("SELECT COUNT(*) FROM sync_queue WHERE synced = FALSE").Scan(&count)
+	return count
+}
+
+func (w *LaravelWrapper) getFailedSyncCount() int {
+	var count int
+	w.localDB.QueryRow("SELECT COUNT(*) FROM sync_queue WHERE synced = FALSE AND retry_count > 0").Scan(&count)
+	return count
+}
+
+func (w *LaravelWrapper) isDBHealthy(db *sql.DB) bool {
+	if db == nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	return db.PingContext(ctx) == nil
 }
 
 func (w *LaravelWrapper) proxyToLaravel(wr http.ResponseWriter, r *http.Request) {
@@ -460,16 +723,13 @@ func (w *LaravelWrapper) syncScheduler() {
 	ticker := time.NewTicker(time.Duration(w.config.SyncInterval) * time.Second)
 	defer ticker.Stop()
 
-	for {
-		select {
-		case <-ticker.C:
-			w.onlineMutex.RLock()
-			online := w.isOnline
-			w.onlineMutex.RUnlock()
+	for range ticker.C {
+		w.onlineMutex.RLock()
+		online := w.isOnline
+		w.onlineMutex.RUnlock()
 
-			if online {
-				w.performSync()
-			}
+		if online {
+			w.performSync()
 		}
 	}
 }
@@ -490,10 +750,11 @@ func (w *LaravelWrapper) performSync() {
 
 	// Get pending sync records
 	rows, err := w.localDB.Query(`
-		SELECT id, table_name, operation, data, created_at 
+		SELECT id, table_name, operation, data, created_at, retry_count
 		FROM sync_queue 
 		WHERE synced = FALSE 
 		ORDER BY created_at ASC
+		LIMIT 100
 	`)
 	if err != nil {
 		log.Printf("Failed to get sync records: %v", err)
@@ -502,15 +763,32 @@ func (w *LaravelWrapper) performSync() {
 	defer rows.Close()
 
 	var syncedIDs []int
+	var failedIDs []int
+	
 	for rows.Next() {
 		var record SyncRecord
-		if err := rows.Scan(&record.ID, &record.TableName, &record.Operation, &record.Data, &record.CreatedAt); err != nil {
+		var retryCount int
+		if err := rows.Scan(&record.ID, &record.TableName, &record.Operation, &record.Data, &record.CreatedAt, &retryCount); err != nil {
 			log.Printf("Failed to scan sync record: %v", err)
 			continue
 		}
 
-		if w.applySyncRecord(record) {
+		// Skip if too many retries
+		if retryCount >= 3 {
+			continue
+		}
+
+		var data map[string]interface{}
+		if err := json.Unmarshal([]byte(record.Data), &data); err != nil {
+			log.Printf("Failed to parse sync data for record %d: %v", record.ID, err)
+			failedIDs = append(failedIDs, record.ID)
+			continue
+		}
+
+		if w.syncRecordToRemote(record.TableName, record.Operation, data) {
 			syncedIDs = append(syncedIDs, record.ID)
+		} else {
+			failedIDs = append(failedIDs, record.ID)
 		}
 	}
 
@@ -518,108 +796,41 @@ func (w *LaravelWrapper) performSync() {
 	if len(syncedIDs) > 0 {
 		w.markAsSynced(syncedIDs)
 		log.Printf("Synced %d records", len(syncedIDs))
-		
+	}
+
+	// Update retry count for failed records
+	if len(failedIDs) > 0 {
+		w.updateRetryCount(failedIDs)
+		log.Printf("Failed to sync %d records", len(failedIDs))
+	}
+
+	if len(syncedIDs) > 0 || len(failedIDs) > 0 {
 		w.broadcast(map[string]interface{}{
-			"type":   "sync_complete",
-			"count":  len(syncedIDs),
+			"type":    "sync_complete",
+			"synced":  len(syncedIDs),
+			"failed":  len(failedIDs),
+			"pending": w.getPendingSyncCount(),
 		})
 	}
 }
 
-func (w *LaravelWrapper) applySyncRecord(record SyncRecord) bool {
-	// Parse JSON data
-	var data map[string]interface{}
-	if err := json.Unmarshal([]byte(record.Data), &data); err != nil {
-		log.Printf("Failed to parse sync data: %v", err)
-		return false
+func (w *LaravelWrapper) updateRetryCount(ids []int) {
+	if len(ids) == 0 {
+		return
 	}
 
-	// Apply operation to remote database
-	switch record.Operation {
-	case "INSERT":
-		return w.performInsert(record.TableName, data)
-	case "UPDATE":
-		return w.performUpdate(record.TableName, data)
-	case "DELETE":
-		return w.performDelete(record.TableName, data)
-	default:
-		log.Printf("Unknown operation: %s", record.Operation)
-		return false
-	}
-}
-
-func (w *LaravelWrapper) performInsert(tableName string, data map[string]interface{}) bool {
-	columns := make([]string, 0, len(data))
-	placeholders := make([]string, 0, len(data))
-	values := make([]interface{}, 0, len(data))
-
-	for col, val := range data {
-		columns = append(columns, col)
-		placeholders = append(placeholders, "?")
-		values = append(values, val)
+	placeholders := make([]string, len(ids))
+	values := make([]interface{}, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		values[i] = id
 	}
 
-	query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
-		tableName,
-		strings.Join(columns, ", "),
-		strings.Join(placeholders, ", "))
-
-	_, err := w.remoteDB.Exec(query, values...)
+	query := fmt.Sprintf("UPDATE sync_queue SET retry_count = retry_count + 1, last_error = 'Sync failed' WHERE id IN (%s)", strings.Join(placeholders, ","))
+	_, err := w.localDB.Exec(query, values...)
 	if err != nil {
-		log.Printf("Failed to insert into %s: %v", tableName, err)
-		return false
+		log.Printf("Failed to update retry count: %v", err)
 	}
-
-	return true
-}
-
-func (w *LaravelWrapper) performUpdate(tableName string, data map[string]interface{}) bool {
-	id, exists := data["id"]
-	if !exists {
-		log.Printf("No ID found for update operation on %s", tableName)
-		return false
-	}
-
-	setParts := make([]string, 0, len(data)-1)
-	values := make([]interface{}, 0, len(data)-1)
-
-	for col, val := range data {
-		if col != "id" {
-			setParts = append(setParts, col+" = ?")
-			values = append(values, val)
-		}
-	}
-
-	values = append(values, id)
-
-	query := fmt.Sprintf("UPDATE %s SET %s WHERE id = ?",
-		tableName,
-		strings.Join(setParts, ", "))
-
-	_, err := w.remoteDB.Exec(query, values...)
-	if err != nil {
-		log.Printf("Failed to update %s: %v", tableName, err)
-		return false
-	}
-
-	return true
-}
-
-func (w *LaravelWrapper) performDelete(tableName string, data map[string]interface{}) bool {
-	id, exists := data["id"]
-	if !exists {
-		log.Printf("No ID found for delete operation on %s", tableName)
-		return false
-	}
-
-	query := fmt.Sprintf("DELETE FROM %s WHERE id = ?", tableName)
-	_, err := w.remoteDB.Exec(query, id)
-	if err != nil {
-		log.Printf("Failed to delete from %s: %v", tableName, err)
-		return false
-	}
-
-	return true
 }
 
 func (w *LaravelWrapper) markAsSynced(ids []int) {
@@ -634,25 +845,130 @@ func (w *LaravelWrapper) markAsSynced(ids []int) {
 		values[i] = id
 	}
 
-	query := fmt.Sprintf("UPDATE sync_queue SET synced = TRUE WHERE id IN (%s)",
-		strings.Join(placeholders, ", "))
-
+	query := fmt.Sprintf("UPDATE sync_queue SET synced = TRUE WHERE id IN (%s)", strings.Join(placeholders, ","))
 	_, err := w.localDB.Exec(query, values...)
 	if err != nil {
 		log.Printf("Failed to mark records as synced: %v", err)
 	}
 }
 
-// AddSyncRecord adds a record to the sync queue
-func (w *LaravelWrapper) AddSyncRecord(tableName, operation string, data map[string]interface{}) error {
-	jsonData, err := json.Marshal(data)
-	if err != nil {
-		return err
+func (w *LaravelWrapper) performInsert(tableName string, data map[string]interface{}) bool {
+	if len(data) == 0 {
+		log.Printf("No data to insert for table %s", tableName)
+		return false
 	}
 
-	query := "INSERT INTO sync_queue (table_name, operation, data) VALUES (?, ?, ?)"
-	_, err = w.localDB.Exec(query, tableName, operation, string(jsonData))
-	return err
+	// Build column names and placeholders
+	columns := make([]string, 0, len(data))
+	placeholders := make([]string, 0, len(data))
+	values := make([]interface{}, 0, len(data))
+
+	for column, value := range data {
+		columns = append(columns, fmt.Sprintf("`%s`", column))
+		placeholders = append(placeholders, "?")
+		values = append(values, value)
+	}
+
+	query := fmt.Sprintf("INSERT INTO `%s` (%s) VALUES (%s)", 
+		tableName, 
+		strings.Join(columns, ", "), 
+		strings.Join(placeholders, ", "))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	_, err := w.remoteDB.ExecContext(ctx, query, values...)
+	if err != nil {
+		log.Printf("Failed to insert into %s: %v", tableName, err)
+		return false
+	}
+
+	log.Printf("Successfully inserted into %s", tableName)
+	return true
+}
+
+func (w *LaravelWrapper) performUpdate(tableName string, data map[string]interface{}) bool {
+	if len(data) == 0 {
+		log.Printf("No data to update for table %s", tableName)
+		return false
+	}
+
+	// Extract ID for WHERE clause
+	id, exists := data["id"]
+	if !exists {
+		log.Printf("No ID found for update in table %s", tableName)
+		return false
+	}
+
+	// Build SET clause
+	setPairs := make([]string, 0, len(data)-1)
+	values := make([]interface{}, 0, len(data)-1)
+
+	for column, value := range data {
+		if column != "id" {
+			setPairs = append(setPairs, fmt.Sprintf("`%s` = ?", column))
+			values = append(values, value)
+		}
+	}
+
+	if len(setPairs) == 0 {
+		log.Printf("No columns to update for table %s", tableName)
+		return false
+	}
+
+	// Add ID to values for WHERE clause
+	values = append(values, id)
+
+	query := fmt.Sprintf("UPDATE `%s` SET %s WHERE `id` = ?", 
+		tableName, 
+		strings.Join(setPairs, ", "))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	result, err := w.remoteDB.ExecContext(ctx, query, values...)
+	if err != nil {
+		log.Printf("Failed to update %s: %v", tableName, err)
+		return false
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		log.Printf("No rows updated in %s for ID %v", tableName, id)
+		return false
+	}
+
+	log.Printf("Successfully updated %s (ID: %v)", tableName, id)
+	return true
+}
+
+func (w *LaravelWrapper) performDelete(tableName string, data map[string]interface{}) bool {
+	// Extract ID for WHERE clause
+	id, exists := data["id"]
+	if !exists {
+		log.Printf("No ID found for delete in table %s", tableName)
+		return false
+	}
+
+	query := fmt.Sprintf("DELETE FROM `%s` WHERE `id` = ?", tableName)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	result, err := w.remoteDB.ExecContext(ctx, query, id)
+	if err != nil {
+		log.Printf("Failed to delete from %s: %v", tableName, err)
+		return false
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		log.Printf("No rows deleted in %s for ID %v", tableName, id)
+		return false
+	}
+
+	log.Printf("Successfully deleted from %s (ID: %v)", tableName, id)
+	return true
 }
 
 func (w *LaravelWrapper) shutdown() {
@@ -666,17 +982,19 @@ func (w *LaravelWrapper) shutdown() {
 		w.remoteDB.Close()
 	}
 
-	// Stop PHP server
-	if w.phpServer != nil && w.phpServer.Process != nil {
-		w.phpServer.Process.Kill()
-	}
-
 	// Close WebSocket connections
 	w.clientsMutex.Lock()
 	for conn := range w.clients {
 		conn.Close()
 	}
 	w.clientsMutex.Unlock()
+
+	// Stop PHP server
+	if w.phpServer != nil && w.phpServer.Process != nil {
+		log.Println("Stopping PHP server...")
+		w.phpServer.Process.Kill()
+		w.phpServer.Wait()
+	}
 
 	log.Println("Shutdown complete")
 }

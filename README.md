@@ -1,578 +1,316 @@
-# Laravel Offline Wrapper
+# Laravel Database Sync Wrapper
 
-A Go-based wrapper that serves Laravel applications locally and synchronizes database changes with a remote database when internet connectivity is restored. Perfect for offline-first Laravel applications on client machines.
+This Go application serves as a sync wrapper for Laravel applications using the `obalaweb/laravel-database-sync` package. It provides offline-first database synchronization capabilities.
 
 ## Features
 
-- **Offline-First**: Serve Laravel applications locally without internet
-- **Auto-Sync**: Automatically synchronizes database changes when online
-- **System Service**: Runs as Windows Service or Linux systemd service
-- **Auto-Start**: Starts automatically when the computer boots
-- **Low Resource Usage**: Optimized for low-budget client machines
-- **Real-time Updates**: WebSocket support for real-time connectivity status
-- **Queue Management**: Intelligent sync queue with operation batching
-- **Laravel Integration**: Easy-to-use traits and commands for Laravel
+- **Offline-First**: Queues database changes locally when remote database is unavailable
+- **Real-time Sync**: Automatically syncs changes when connectivity is restored
+- **WebSocket Support**: Real-time status updates via WebSocket connections
+- **Laravel Integration**: Seamlessly integrates with Laravel applications
+- **Retry Logic**: Automatically retries failed sync operations
+- **Monitoring**: Built-in endpoints for monitoring sync status
 
-## Quick Start
+## Setup
 
-### For Windows
+### 1. Laravel Application Setup
 
-1. **Prerequisites**:
-   - Install Go from https://golang.org/dl/
-   - Install XAMPP or standalone MySQL
-   - Install PHP (usually comes with XAMPP)
+Install the Laravel package:
 
-2. **Build and Install**:
-   ```batch
-   # Build the application
-   build.bat
-   
-   # Edit config.json with your database settings
-   notepad config.json
-   
-   # Install as Windows Service (Run as Administrator)
-   install-service.bat
-   ```
+```bash
+composer require obalaweb/laravel-database-sync
+```
 
-3. **Your Laravel app is now running at**: http://localhost:8080
+Publish the configuration:
 
-### For Linux (Ubuntu/Debian)
+```bash
+php artisan vendor:publish --provider="LaravelDatabaseSync\DatabaseSyncServiceProvider" --tag="config"
+```
 
-1. **Prerequisites**:
+Configure your `.env` file:
+
+```env
+DATABASE_SYNC_ENABLED=true
+DATABASE_SYNC_ENDPOINT=http://localhost:8080/sync-record
+DATABASE_SYNC_TIMEOUT=5
+```
+
+### 2. Go Application Setup
+
+1. **Install Dependencies**:
    ```bash
-   # Install Go
-   sudo apt update
-   sudo apt install golang-go mysql-server php php-mysql php-cli composer
-   
-   # Start MySQL
-   sudo systemctl start mysql
-   sudo systemctl enable mysql
+   go mod init laravel-sync-wrapper
+   go get github.com/go-sql-driver/mysql
+   go get github.com/gorilla/mux
+   go get github.com/gorilla/websocket
    ```
 
-2. **Build and Install**:
+2. **Create Configuration**:
+   Create a `config.json` file in your project root (see config.json artifact).
+
+3. **Build and Run**:
    ```bash
-   # Make build script executable
-   chmod +x build.sh
-   
-   # Build the application
-   ./build.sh
-   
-   # Edit config.json with your database settings
-   nano config.json
-   
-   # Install as systemd service
-   sudo ./install-service.sh
+   go build -o laravel-sync-wrapper
+   ./laravel-sync-wrapper
    ```
-
-3. **Your Laravel app is now running at**: http://localhost:8080
 
 ## Configuration
 
-Edit `config.json` before installing the service:
+### Database Setup
 
-```json
-{
-  "laravel_path": "./laravel-app",
-  "local_port": 8080,
-  "php_port": 8000,
-  "local_db": {
-    "host": "localhost",
-    "port": 3306,
-    "database": "laravel_local",
-    "username": "root",
-    "password": "your_password"
-  },
-  "remote_db": {
-    "host": "your-remote-server.com",
-    "port": 3306,
-    "database": "laravel_remote",
-    "username": "remote_user",
-    "password": "remote_password"
-  },
-  "sync_interval_seconds": 30,
-  "connectivity_check_interval_seconds": 10
-}
+Create the local database and ensure both local and remote databases exist:
+
+```sql
+-- Local database
+CREATE DATABASE laravel_local;
+
+-- Remote database (on remote server)
+CREATE DATABASE laravel_remote;
 ```
 
-## Laravel Integration
+### Laravel Models
 
-### 1. Add the sync migration:
-
-```bash
-cd laravel-app
-php artisan make:migration create_sync_queue_table
-```
-
-Copy the migration content from `create_sync_queue_table.php`.
-
-### 2. Add the SyncableTrait to your models:
+Your Laravel models will automatically sync when using the package. For custom control, implement the `SyncableModelInterface`:
 
 ```php
 <?php
 
 namespace App\Models;
 
-use App\Traits\SyncableTrait;
 use Illuminate\Database\Eloquent\Model;
+use LaravelDatabaseSync\Contracts\SyncableModelInterface;
+use LaravelDatabaseSync\Traits\SyncableModel;
 
-class User extends Model
+class User extends Model implements SyncableModelInterface
 {
-    use SyncableTrait;
-    
-    // Optional: Exclude sensitive fields from sync
-    protected $syncExclude = ['password', 'remember_token'];
+    use SyncableModel;
+
+    protected $fillable = [
+        'name',
+        'email',
+        'password',
+    ];
+
+    public function getSyncableData(): array
+    {
+        $data = $this->toArray();
+        unset($data['password']);
+        return $data;
+    }
+
+    public function shouldSync(): bool
+    {
+        return $this->status === 'active';
+    }
 }
 ```
-
-### 3. Run migrations:
-
-```bash
-php artisan migrate
-```
-
-## Service Management
-
-### Windows
-
-```batch
-# Check service status
-sc query LaravelWrapper
-
-# Start service
-sc start LaravelWrapper
-
-# Stop service
-sc stop LaravelWrapper
-
-# Restart service
-sc stop LaravelWrapper && timeout /t 3 && sc start LaravelWrapper
-
-# Uninstall service
-uninstall-service.bat
-```
-
-### Linux
-
-```bash
-# Check service status
-sudo systemctl status laravel-wrapper
-
-# Start service
-sudo systemctl start laravel-wrapper
-
-# Stop service
-sudo systemctl stop laravel-wrapper
-
-# Restart service
-sudo systemctl restart laravel-wrapper
-
-# View logs
-sudo journalctl -u laravel-wrapper -f
-
-# Uninstall service
-sudo systemctl stop laravel-wrapper
-sudo systemctl disable laravel-wrapper
-sudo rm /etc/systemd/system/laravel-wrapper.service
-sudo systemctl daemon-reload
-```
-
-## Client Machine Setup
-
-### Minimum Requirements
-- **RAM**: 2GB (4GB recommended)
-- **Storage**: 1GB free space
-- **OS**: Windows 7+ or Linux (Ubuntu 18.04+)
-- **Network**: Intermittent internet connection
-
-### Typical Setup Process
-
-1. **Download and extract** the application files to a permanent location (e.g., `C:\laravel-wrapper` or `/opt/laravel-wrapper`)
-
-2. **Install dependencies**:
-   - **Windows**: XAMPP (includes PHP, MySQL, Apache)
-   - **Linux**: `sudo apt install mysql-server php php-mysql composer`
-
-3. **Configure databases**:
-   - Create local MySQL database
-   - Configure remote database connection
-   - Update `config.json` with credentials
-
-4. **Install your Laravel application**:
-   ```bash
-   # Place your Laravel app in the configured directory
-   cp -r your-laravel-app ./laravel-app
-   
-   # Or create new Laravel app
-   composer create-project laravel/laravel laravel-app
-   ```
-
-5. **Build and install service**:
-   - Run build script
-   - Edit configuration
-   - Install as system service
-
-6. **Test the setup**:
-   - Access http://localhost:8080
-   - Check service status
-   - Verify database connectivity
-
-## Troubleshooting
-
-### Common Issues
-
-1. **Service won't start**:
-   - Check if MySQL is running
-   - Verify Laravel app path in config
-   - Check logs: `laravel-wrapper.log`
-
-2. **Database connection failed**:
-   - Verify database credentials
-   - Check if MySQL service is running
-   - Test connection manually
-
-3. **PHP errors**:
-   - Check if PHP is installed and in PATH
-   - Verify Laravel app is properly configured
-   - Check Laravel logs in `laravel-app/storage/logs/`
-
-4. **Port conflicts**:
-   - Change ports in config.json
-   - Check if other services use ports 8080/8000
-
-### Log Files
-
-- **Windows**: `laravel-wrapper.log` in installation directory
-- **Linux**: `sudo journalctl -u laravel-wrapper -f`
-- **Laravel**: `laravel-app/storage/logs/laravel.log`
-
-### Performance Tips for Low-Budget Machines
-
-1. **Memory optimization**:
-   - Set `memory_limit` in PHP to 256M
-   - Use SQLite for local database if needed
-   - Reduce sync frequency for very slow connections
-
-2. **CPU optimization**:
-   - Service runs with CPU limits (50% max)
-   - PHP processes are automatically managed
-   - Sync operations are throttled
-
-3. **Storage optimization**:
-   - Regular cleanup of old sync records
-   - Log rotation configured
-   - Temporary files cleaned automatically
-
-## File Structure
-
-```
-laravel-wrapper/
-├── main.go                     # Main application
-├── go.mod                      # Go dependencies
-├── config.json                 # Configuration
-├── build.sh / build.bat        # Build scripts# Laravel Offline Wrapper
-
-A Go-based wrapper that serves Laravel applications locally and synchronizes database changes with a remote database when internet connectivity is restored. Perfect for offline-first Laravel applications.
-
-## Features
-
-- **Offline-First**: Serve Laravel applications locally without internet
-- **Auto-Sync**: Automatically synchronizes database changes when online
-- **Real-time Updates**: WebSocket support for real-time connectivity status
-- **Queue Management**: Intelligent sync queue with operation batching
-- **Laravel Integration**: Easy-to-use traits and commands for Laravel
-- **Docker Support**: Full Docker and Docker Compose configuration
-- **Health Monitoring**: Built-in status endpoints and health checks
-
-## Quick Start
-
-### 1. Setup
-
-```bash
-# Clone or create the project
-git clone <repository-url>
-cd laravel-wrapper
-
-# Install Go dependencies
-go mod download
-
-# Setup Laravel application
-make setup-laravel
-
-# Configure database settings
-cp config.json.example config.json
-# Edit config.json with your database settings
-```
-
-### 2. Configuration
-
-Edit `config.json`:
-
-```json
-{
-  "laravel_path": "./laravel-app",
-  "local_port": 8080,
-  "php_port": 8000,
-  "local_db": {
-    "host": "localhost",
-    "port": 3306,
-    "database": "laravel_local",
-    "username": "root",
-    "password": ""
-  },
-  "remote_db": {
-    "host": "your-remote-db.com",
-    "port": 3306,
-    "database": "laravel_remote",
-    "username": "remote_user",
-    "password": "remote_password"
-  },
-  "sync_interval_seconds": 30,
-  "connectivity_check_interval_seconds": 10
-}
-```
-
-### 3. Laravel Integration
-
-#### Add the sync migration:
-
-```bash
-cd laravel-app
-php artisan make:migration create_sync_queue_table
-```
-
-Copy the migration content from the provided migration file.
-
-#### Add the SyncableTrait to your models:
-
-```php
-<?php
-
-namespace App\Models;
-
-use App\Traits\SyncableTrait;
-use Illuminate\Database\Eloquent\Model;
-
-class User extends Model
-{
-    use SyncableTrait;
-    
-    // Optional: Exclude fields from sync
-    protected $syncExclude = ['password', 'remember_token'];
-}
-```
-
-#### Register the sync command:
-
-Add to `app/Console/Kernel.php`:
-
-```php
-protected $commands = [
-    \App\Console\Commands\SyncCommand::class,
-];
-```
-
-### 4. Run the Application
-
-```bash
-# Build and run
-make run
-
-# Or with Docker
-make docker-run
-
-# Check status
-make status
-
-# Force sync
-make sync
-```
-
-## Architecture
-
-### Components
-
-1. **Go Wrapper**: Main application that manages:
-   - Laravel PHP server proxy
-   - Database connectivity monitoring
-   - Sync queue management
-   - WebSocket connections
-
-2. **Laravel Application**: Your standard Laravel app with:
-   - SyncableTrait for automatic sync queue population
-   - Sync commands for manual operations
-   - Migration for sync queue table
-
-3. **Database Layer**:
-   - Local MySQL database for offline operations
-   - Remote MySQL database for synchronized data
-   - Sync queue table for tracking changes
-
-### Sync Process
-
-1. **Offline Mode**: All database changes are captured by the SyncableTrait
-2. **Queue Storage**: Changes are stored in the local `sync_queue` table
-3. **Connectivity Check**: Regular checks for remote database availability
-4. **Sync Execution**: When online, queued changes are applied to remote database
-5. **Queue Cleanup**: Successfully synced records are marked as completed
 
 ## API Endpoints
 
-### Status Endpoint
-```
-GET /status
-```
+### Status and Monitoring
 
-Returns current status including connectivity and pending sync count.
+- **GET /status**: Get current sync status
+- **GET /health**: Health check for all services
+- **GET /queue/status**: Get sync queue status
+- **GET /ws**: WebSocket connection for real-time updates
 
-### Sync Endpoint
-```
-POST /sync
-```
+### Sync Operations
 
-Manually triggers a sync operation.
+- **POST /sync-record**: Laravel sync endpoint (used by Laravel package)
+- **POST /sync**: Trigger manual sync
+- **POST /queue/clear**: Clear completed sync records
+- **POST /queue/retry**: Retry failed sync operations
 
-### WebSocket Endpoint
-```
-WS /ws
-```
+### WebSocket Events
 
-Real-time updates for connectivity changes and sync status.
+The WebSocket connection provides real-time updates:
 
-## Laravel Commands
+```javascript
+const ws = new WebSocket('ws://localhost:8080/ws');
 
-### Check Sync Status
-```bash
-php artisan sync:status
-```
-
-### Force Sync
-```bash
-php artisan sync:status --force
+ws.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+    console.log('Sync event:', data);
+};
 ```
 
-## Docker Usage
+Event types:
+- `status`: Connection status updates
+- `queue_status`: Queue status updates
+- `sync_immediate`: Immediate sync success
+- `sync_queued`: Record queued for sync
+- `sync_complete`: Batch sync completion
+- `connectivity`: Connectivity status change
 
-### Build and Run
-```bash
-# Build the Docker image
-make docker-build
+## Operation Modes
 
-# Run with Docker Compose
-make docker-run
+### Online Mode
+- Changes are synced immediately to remote database
+- Laravel receives immediate success response
+- Real-time synchronization
 
-# View logs
-make docker-logs
+### Offline Mode
+- Changes are queued locally
+- Laravel receives success response (queued)
+- Automatic sync when connectivity restored
 
-# Stop services
-make docker-stop
+## Monitoring
+
+### Status Endpoint Response
+```json
+{
+  "online": true,
+  "pending_sync": 0,
+  "failed_sync": 0,
+  "local_port": 8080,
+  "php_port": 8000,
+  "timestamp": "2025-01-15T10:30:00Z"
+}
 ```
 
-### Services Included
-
-- **laravel-wrapper**: Main Go application
-- **mysql**: Local MySQL database
-- **phpmyadmin**: Web interface for database management (http://localhost:8081)
-
-## Development
-
-### Project Structure
-```
-laravel-wrapper/
-├── main.go                 # Main Go application
-├── config.json            # Configuration file
-├── go.mod                  # Go module dependencies
-├── Dockerfile             # Docker configuration
-├── docker-compose.yml     # Docker Compose setup
-├── Makefile              # Build and run commands
-├── laravel-app/          # Laravel application directory
-│   ├── app/
-│   │   ├── Traits/
-│   │   │   └── SyncableTrait.php
-│   │   └── Console/
-│   │       └── Commands/
-│   │           └── SyncCommand.php
-│   └── database/
-│       └── migrations/
-└── README.md
+### Queue Status Response
+```json
+{
+  "pending_count": 5,
+  "failed_count": 2,
+  "oldest_pending": "2025-01-15T10:25:00Z",
+  "timestamp": "2025-01-15T10:30:00Z"
+}
 ```
 
-### Adding New Features
+## Laravel Package Integration
 
-1. **Extend the SyncableTrait**: Add custom sync logic for specific models
-2. **Modify Sync Operations**: Customize how different operations are handled
-3. **Add Webhooks**: Implement webhook support for real-time notifications
-4. **Enhance Monitoring**: Add metrics and logging for better observability
+The wrapper expects HTTP POST requests from Laravel with this structure:
 
-## Configuration Options
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `laravel_path` | Path to Laravel application | `./laravel-app` |
-| `local_port` | Port for the wrapper server | `8080` |
-| `php_port` | Port for PHP built-in server | `8000` |
-| `local_db` | Local database configuration | - |
-| `remote_db` | Remote database configuration | - |
-| `sync_interval_seconds` | How often to sync when online | `30` |
-| `connectivity_check_interval_seconds` | How often to check connectivity | `10` |
+```json
+{
+  "table_name": "users",
+  "operation": "INSERT|UPDATE|DELETE",
+  "data": {
+    "id": 1,
+    "name": "John Doe",
+    "email": "john@example.com",
+    "created_at": "2025-01-15T10:30:00.000000Z",
+    "updated_at": "2025-01-15T10:30:00.000000Z"
+  }
+}
+```
 
 ## Troubleshooting
 
 ### Common Issues
 
-1. **PHP Server Won't Start**
-   - Check if Laravel application exists at configured path
-   - Verify PHP is installed and accessible
-   - Check port availability
+1. **Laravel PHP Server Not Starting**
+   - Ensure Laravel directory exists
+   - Check PHP is installed and accessible
+   - Verify Laravel dependencies are installed
 
-2. **Database Connection Failed**
-   - Verify database credentials
-   - Check if MySQL service is running
-   - Test connectivity manually
+2. **Database Connection Issues**
+   - Check database credentials in config.json
+   - Ensure databases exist
+   - Verify network connectivity
 
-3. **Sync Not Working**
-   - Check remote database connectivity
-   - Verify sync queue table exists
-   - Check Laravel application logs
+3. **Sync Operations Failing**
+   - Check remote database schema matches local
+   - Verify table structures are identical
+   - Review logs for specific errors
 
-### Debug Mode
+### Logging
 
-Run with verbose logging:
+All operations are logged to:
+- Console output
+- `laravel-wrapper.log` file
+
+View logs:
 ```bash
-./laravel-wrapper -v
+tail -f laravel-wrapper.log
 ```
 
-### Health Checks
+### Laravel Integration Testing
+
+Test the integration:
 
 ```bash
-# Check wrapper status
-curl http://localhost:8080/status
+# Check if sync service is running
+curl -X GET http://localhost:8080/status
 
-# Check PHP server
-curl http://localhost:8000
-
-# Check database connectivity
-mysql -h localhost -u root -p laravel_local
+# Test sync endpoint
+curl -X POST http://localhost:8080/sync-record \
+  -H "Content-Type: application/json" \
+  -d '{
+    "table_name": "users",
+    "operation": "INSERT",
+    "data": {
+      "id": 1,
+      "name": "Test User",
+      "email": "test@example.com"
+    }
+  }'
 ```
+
+## Production Deployment
+
+### Systemd Service
+
+Create `/etc/systemd/system/laravel-sync.service`:
+
+```ini
+[Unit]
+Description=Laravel Database Sync Wrapper
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/path/to/your/app
+ExecStart=/path/to/your/app/laravel-sync-wrapper
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start:
+```bash
+sudo systemctl enable laravel-sync.service
+sudo systemctl start laravel-sync.service
+```
+
+### Docker Support
+
+```dockerfile
+FROM golang:1.21-alpine AS builder
+
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN go build -o laravel-sync-wrapper
+
+FROM alpine:latest
+RUN apk --no-cache add ca-certificates
+WORKDIR /root/
+
+COPY --from=builder /app/laravel-sync-wrapper .
+COPY --from=builder /app/config.json .
+
+CMD ["./laravel-sync-wrapper"]
+```
+
+## Security Considerations
+
+- Use secure database credentials
+- Implement authentication for API endpoints in production
+- Use HTTPS for remote database connections
+- Restrict network access to sync endpoints
+- Monitor sync operations for suspicious activity
 
 ## Contributing
 
 1. Fork the repository
 2. Create a feature branch
 3. Make your changes
-4. Add tests if applicable
+4. Add tests
 5. Submit a pull request
-
-## License
-
-This project is licensed under the MIT License. See LICENSE file for details.
-
-## Support
-
-For issues and questions:
-- Create an issue in the GitHub repository
-- Check the troubleshooting section
-- Review the logs for error messages
-
----
-
-**Note**: This wrapper is designed for development and testing environments. For production use, consider additional security measures and monitoring solutions.

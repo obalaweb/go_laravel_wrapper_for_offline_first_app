@@ -5,16 +5,16 @@
   "local_db": {
     "host": "localhost",
     "port": 3306,
-    "database": "laravel_local",
+    "database": "sync_db",
     "username": "root",
-    "password": ""
+    "password": "password"
   },
   "remote_db": {
-    "host": "192.168.1.100",
+    "host": "remote_host",
     "port": 3306,
-    "database": "pos",
-    "username": "root",
-    "password": "obala@gmail.Joz5"
+    "database": "remote_db",
+    "username": "remote_user",
+    "password": "remote_password"
   },
   "sync_interval_seconds": 60,
   "connectivity_check_interval_seconds": 10
