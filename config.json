@@ -1,0 +1,21 @@
+{
+  "laravel_path": "./application",
+  "local_port": 8080,
+  "php_port": 8000,
+  "local_db": {
+    "host": "localhost",
+    "port": 3306,
+    "database": "laravel_local",
+    "username": "root",
+    "password": ""
+  },
+  "remote_db": {
+    "host": "192.168.1.100",
+    "port": 3306,
+    "database": "pos",
+    "username": "root",
+    "password": "obala@gmail.Joz5"
+  },
+  "sync_interval_seconds": 60,
+  "connectivity_check_interval_seconds": 10
+}
